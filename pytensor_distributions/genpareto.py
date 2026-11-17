@@ -14,7 +14,7 @@ def _const_like(value, *refs):
     keeps each function's output dtype following its arguments while preserving
     full float64 precision when the inputs are float64.
     """
-    dtype = np.result_type(*(pt.as_tensor_variable(r).dtype for r in refs))
+    dtype = pt.true_div(pt.add(*refs), 1).dtype if len(refs) > 1 else pt.true_div(refs[0], 1).dtype
     return np.asarray(value, dtype=dtype)
 
 
@@ -57,25 +57,29 @@ def _expm1_div(u: TensorVariable) -> TensorVariable:
     return pt.switch(use_series, series, pt.expm1(safe_u) / safe_u)
 
 
-def _gpd_log_h(z, sigma, xi):
-    """GPD log-density, in-support expression (no support masking)."""
+def _gpd_coordinates(x, mu, sigma, xi):
+    """Return log survival and log(1 + xi*z) on the interior, plus support masks."""
+    delta = pt.sub(x, mu)
+    z = delta / sigma
     t = xi * z
-    return -pt.log(sigma) - pt.log1p(t) - z * _log1p_div(t)
-
-
-def _gpd_log_S(z, xi):
-    """GPD log survival ``log(1 - H) = -m``, in-support expression.
-
-    Computed directly from the survival exponent ``m = log1p(xi z) / xi`` rather
-    than as ``log1mexp(log H)``, so it stays accurate arbitrarily deep in the upper
-    tail (where ``log H -> 0`` and any ``H``-based route underflows).
-    """
-    return -(z * _log1p_div(xi * z))
-
-
-def _gpd_log_H(z, xi):
-    """GPD log-CDF, in-support expression (no support masking / no saturation)."""
-    return pt.log1mexp(_gpd_log_S(z, xi))
+    above = pt.lt(xi, 0) & pt.le(1 + t, 0)
+    inside = (delta > 0) & ~above & ~pt.isinf(x)
+    # A positive shape has a finite log survival even when z or xi*z overflows.
+    large = inside & pt.gt(xi, 0) & (pt.isinf(z) | pt.isinf(t))
+    regular = inside & ~large
+    safe_z = pt.switch(regular, z, 0)
+    safe_t = pt.switch(regular, t, 0)
+    half_delta = pt.mul(x, 0.5) - pt.mul(mu, 0.5)
+    log_delta = pt.switch(
+        pt.isinf(delta),
+        pt.log(pt.switch(pt.isinf(delta), half_delta, 1)) + _const_like(np.log(2.0), delta),
+        pt.log(pt.switch(large, delta, 1)),
+    )
+    log_product = pt.log(pt.switch(large, xi, 1)) + log_delta - pt.log(sigma)
+    log_margin = pt.switch(large, pt.softplus(log_product), pt.log1p(safe_t))
+    hazard = pt.switch(large, log_margin / pt.switch(large, xi, 1), safe_z * _log1p_div(safe_t))
+    upper_tail = above | pt.eq(x, np.inf)
+    return -hazard, log_margin, delta, upper_tail, pt.lt(xi, 0) & pt.eq(1 + t, 0)
 
 
 def _gpd_quantile_from_excess(excess, mu, sigma, xi):
@@ -95,50 +99,24 @@ def _gpd_upper_bound(mu, sigma, xi):
     return pt.switch(has_bounded_support, mu - sigma / div_xi, np.inf)
 
 
-def _in_gpd_support(z, xi):
-    """GPD support mask: ``z >= 0`` and (for ``xi < 0``) ``s = 1 + xi z > 0``."""
-    return pt.and_(z >= 0, 1 + xi * z > 0)
+def _endpoint_logpdf(sigma, xi):
+    return pt.switch(pt.lt(xi, -1), np.inf, pt.switch(pt.eq(xi, -1), -pt.log(sigma), -np.inf))
 
 
 def logpdf(x, mu, sigma, xi):
-    z = (x - mu) / sigma
-    logp = pt.switch(_in_gpd_support(z, xi), _gpd_log_h(z, sigma, xi), -np.inf)
-    # The density vanishes at the +inf tail for every xi; for xi > 0 the
-    # in-support branch would evaluate log1p(inf)/inf -> nan there, so pin
-    # z = +inf to -inf explicitly.
-    logp = pt.switch(pt.eq(z, np.inf), -np.inf, logp)
-    # At the finite upper endpoint (xi < 0, 1 + xi z = 0) the density diverges for
-    # xi < -1, equals 1/sigma at xi = -1, and is 0 for -1 < xi < 0 (matches scipy's
-    # genpareto, and keeps pdf(mode) consistent where mode is that endpoint).
-    at_endpoint = pt.and_(pt.lt(xi, 0), pt.eq(1 + xi * z, 0))
-    endpoint = pt.switch(pt.lt(xi, -1), np.inf, pt.switch(pt.eq(xi, -1), -pt.log(sigma), -np.inf))
-    logp = pt.switch(at_endpoint, endpoint, logp)
-    return logp
+    log_s, log_margin, delta, upper, endpoint = _gpd_coordinates(x, mu, sigma, xi)
+    value = pt.switch((delta >= 0) & ~upper, log_s - log_margin - pt.log(sigma), -np.inf)
+    return pt.switch(endpoint, _endpoint_logpdf(sigma, xi), value)
 
 
 def logcdf(x, mu, sigma, xi):
-    z = (x - mu) / sigma
-    # Three regions: below mu -> 0 (log -inf); for xi < 0 past the finite upper
-    # endpoint mu - sigma/xi -> 1 (log 0); else log1mexp(-m).
-    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + xi * z, 0))
-    logcdf = pt.switch(above_upper, 0.0, _gpd_log_H(z, xi))
-    logcdf = pt.switch(z >= 0, logcdf, -np.inf)
-    # CDF -> 1 (logcdf 0) at the +inf tail; for xi > 0 _gpd_log_H(inf) is nan.
-    logcdf = pt.switch(pt.eq(z, np.inf), 0.0, logcdf)
-    return logcdf
+    log_s, _, delta, upper, _ = _gpd_coordinates(x, mu, sigma, xi)
+    return pt.switch(upper, 0.0, pt.switch(delta > 0, pt.log1mexp(log_s), -np.inf))
 
 
 def logsf(x, mu, sigma, xi):
-    z = (x - mu) / sigma
-    # m directly (log S = -m): accurate in the heavy tail, where the generic
-    # log1mexp(logcdf) survival fallback collapses (logcdf -> 0 there).
-    logsf = _gpd_log_S(z, xi)
-    # For xi < 0 past the finite upper endpoint, and at the +inf tail, S = 0.
-    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + xi * z, 0))
-    logsf = pt.switch(pt.or_(above_upper, pt.eq(z, np.inf)), -np.inf, logsf)
-    # Below mu the survival is 1 (logsf 0).
-    logsf = pt.switch(z < 0, 0.0, logsf)
-    return logsf
+    log_s, _, _, upper, _ = _gpd_coordinates(x, mu, sigma, xi)
+    return pt.switch(upper, -np.inf, log_s)
 
 
 def ppf(q, mu, sigma, xi):
@@ -181,6 +159,8 @@ def ppf_logit(y, mu, sigma, xi):
 
 def rvs(mu, sigma, xi, size=None, random_state=None):
     # Inverse-CDF on a survival draw: excess = -log(v) avoids the 1 - v cancellation.
+    if size is None:
+        size = pt.broadcast_arrays(mu, sigma, xi)[0].shape
     v = pt.random.uniform(size=size, rng=random_state, return_next_rng=True)[1]
     return _gpd_quantile_from_excess(-pt.log(v), mu, sigma, xi)
 

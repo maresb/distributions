@@ -6,15 +6,13 @@ from pytensor.tensor.special import betaln
 
 from pytensor_distributions.genpareto import (
     _const_like,
-    _gpd_log_H,
-    _gpd_log_h,
-    _gpd_log_S,
+    _endpoint_logpdf,
+    _gpd_coordinates,
     _gpd_quantile_from_excess,
     _gpd_upper_bound,
-    _in_gpd_support,
     _log1p_div,
 )
-from pytensor_distributions.helper import continuous_mode, ppf_bounds_cont
+from pytensor_distributions.helper import ppf_bounds_cont
 
 # Extended Generalized Pareto core. Naveau et al. (2016) extended GPD with
 # carrier G(v) = v ** kappa: the CDF is F = H ** kappa with H the GPD CDF, so
@@ -23,51 +21,43 @@ from pytensor_distributions.helper import continuous_mode, ppf_bounds_cont
 
 
 def logpdf(x, mu, sigma, xi, kappa):
-    z = (x - mu) / sigma
-    # log g = log kappa + (kappa - 1) log H + log h. The carrier term vanishes
-    # at kappa = 1; guarding it keeps the GPD reduction exact at the lower
-    # endpoint (z = 0, log H = -inf), where (kappa - 1) * log H would be 0 * -inf.
-    carrier = pt.switch(pt.eq(kappa, 1.0), 0.0, (kappa - 1) * _gpd_log_H(z, xi))
-    logp = pt.log(kappa) + carrier + _gpd_log_h(z, sigma, xi)
-    logp = pt.switch(_in_gpd_support(z, xi), logp, -np.inf)
-    logp = pt.switch(pt.eq(z, np.inf), -np.inf, logp)
-    return logp
+    log_s, log_margin, delta, upper, endpoint = _gpd_coordinates(x, mu, sigma, xi)
+    interior = (delta > 0) & ~upper
+    log_h = pt.log1mexp(pt.switch(interior, log_s, -1))
+    value = pt.log(kappa) + (kappa - 1) * log_h + log_s - log_margin - pt.log(sigma)
+    lower_value = pt.switch(
+        pt.eq(kappa, 1), -pt.log(sigma), pt.switch(pt.lt(kappa, 1), np.inf, -np.inf)
+    )
+    value = pt.switch(interior, value, pt.switch(pt.eq(delta, 0), lower_value, -np.inf))
+    return pt.switch(endpoint, pt.log(kappa) + _endpoint_logpdf(sigma, xi), value)
+
+
+def _log_probabilities(x, mu, sigma, xi, kappa):
+    log_s, _, delta, upper, _ = _gpd_coordinates(x, mu, sigma, xi)
+    interior = (delta > 0) & ~upper
+    a = pt.switch(interior, log_s, -1.0)
+    log_eps = _const_like(np.log(np.finfo(a.dtype).eps), a)
+    # log(-log H) tends to log S when S is small. Keep the carrier in logs
+    # until after scaling, even when exp(log S) itself would underflow.
+    small_s = a < log_eps
+    log_h = pt.log1mexp(pt.switch(small_s, -1.0, a))
+    log_rate = pt.log(kappa) + pt.switch(small_s, a, pt.log(-log_h))
+    logcdf = pt.switch(small_s, -pt.exp(log_rate), kappa * log_h)
+    logsf = pt.switch(
+        log_rate < log_eps, log_rate, pt.log1mexp(-pt.exp(pt.clip(log_rate, log_eps, 7.0)))
+    )
+    return (
+        pt.switch(upper, 0.0, pt.switch(interior, logcdf, -np.inf)),
+        pt.switch(upper, -np.inf, pt.switch(interior, logsf, 0.0)),
+    )
 
 
 def logcdf(x, mu, sigma, xi, kappa):
-    z = (x - mu) / sigma
-    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + xi * z, 0))
-    logcdf = pt.switch(above_upper, 0.0, kappa * _gpd_log_H(z, xi))
-    logcdf = pt.switch(z >= 0, logcdf, -np.inf)
-    logcdf = pt.switch(pt.eq(z, np.inf), 0.0, logcdf)
-    return logcdf
+    return _log_probabilities(x, mu, sigma, xi, kappa)[0]
 
 
 def logsf(x, mu, sigma, xi, kappa):
-    z = (x - mu) / sigma
-    a = _gpd_log_S(z, xi)  # log(1 - H), accurate in the tail
-    log_H = pt.log1mexp(a)
-    generic = pt.log1mexp(kappa * log_H)
-    s = pt.exp(a)  # S_gpd
-    # r = kappa * S_gpd, formed via exp(log kappa + a) and capped at 1 so the unused
-    # (generic-branch) tail expression cannot overflow.
-    r = pt.exp(pt.minimum(pt.log(kappa) + a, 0.0))
-    # 1 - H**kappa = kappa S [1 + (s - r)/2 + (r**2 - 3 r s + 2 s**2)/6 + ...].
-    # This is a Taylor expansion in *both* S_gpd and kappa*S_gpd, so it is only
-    # valid where both are small; writing it in r = kappa S and s = S keeps every
-    # term bounded (no kappa**k powers, which overflow for huge kappa).
-    series_m1 = (s - r) / 2.0 + (r * r - 3.0 * r * s + 2.0 * s * s) / 6.0
-    tail = pt.log(kappa) + a + pt.log1p(series_m1)
-    # The Taylor tail runs where S_gpd and kappa*S_gpd are both below machine epsilon
-    # (a < log_eps and log(kappa) + a < log_eps); the generic log1mexp(kappa log H) runs
-    # otherwise. Both conditions gate the switch: for tiny kappa the second holds in the body
-    # (S_gpd ~ 1) too, where the Taylor does not apply.
-    log_eps = float(np.log(np.finfo(a.dtype).eps))
-    logsf = pt.switch(pt.and_(a < log_eps, pt.log(kappa) + a < log_eps), tail, generic)
-    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + xi * z, 0))
-    logsf = pt.switch(pt.or_(above_upper, pt.eq(z, np.inf)), -np.inf, logsf)
-    logsf = pt.switch(z < 0, 0.0, logsf)
-    return logsf
+    return _log_probabilities(x, mu, sigma, xi, kappa)[1]
 
 
 def _ext_gpd_excess_from_log_prob(log_q, kappa):
@@ -98,6 +88,7 @@ def _ext_gpd_excess_from_logit(value, kappa):
     The unused branch's inputs are clamped (log_F via cutoff, a via log_max) so it stays finite.
     Backs ``ppf_logit``.
     """
+    value = pt.true_div(value, 1)
     finfo = np.finfo(value.dtype)
     log_max = float(np.log(finfo.max))  # a = exp(min(log_a, log_max)) stays finite
     log_eps = float(np.log(finfo.eps))  # at or below log_eps, m = -log_a
@@ -161,6 +152,8 @@ def ppf_logit(y, mu, sigma, xi, kappa):
 
 def rvs(mu, sigma, xi, kappa, size=None, random_state=None):
     # Inverse-CDF on a carrier draw u = F; excess = -log(1 - u ** (1/kappa)).
+    if size is None:
+        size = pt.broadcast_arrays(mu, sigma, xi, kappa)[0].shape
     u = pt.random.uniform(size=size, rng=random_state, return_next_rng=True)[1]
     excess = _ext_gpd_excess_from_log_prob(pt.log(u), kappa)
     return _gpd_quantile_from_excess(excess, mu, sigma, xi)
@@ -328,25 +321,14 @@ def median(mu, sigma, xi, kappa):
 
 
 def mode(mu, sigma, xi, kappa):
-    # No closed form for kappa != 1, so the interior case is a grid search:
-    #   xi < -1:                 density diverges at the finite upper endpoint (h blows up);
-    #   xi >= -1 and kappa <= 1: density peaks at the lower endpoint mu (H ** (kappa - 1)
-    #                            blows up for kappa < 1; the kappa = 1 GPD decreases from mu);
-    #   xi >= -1 and kappa > 1:  interior mode.
-    # This matches GenPareto.mode at kappa = 1.
-    upper = _gpd_upper_bound(mu, sigma, xi)
-    interior = continuous_mode(
-        mu,
-        ppf(np.asarray(1.0 - 1e-3), mu, sigma, xi, kappa),
-        logpdf,
-        mu,
-        sigma,
-        xi,
-        kappa,
-        n_points=1000,
-    )
-    at_mu = pt.broadcast_arrays(mu, sigma, xi, kappa)[0]
-    return pt.switch(pt.lt(xi, -1), upper, pt.switch(pt.le(kappa, 1.0), at_mu, interior))
+    # In GPD-CDF coordinates the density is proportional to
+    # H**(kappa-1) * (1-H)**(1+xi). Its interior maximum has odds
+    # H/(1-H) = (kappa-1)/(1+xi).
+    interior = pt.gt(kappa, 1) & pt.gt(xi, -1)
+    odds = pt.switch(interior, kappa - 1, 0) / pt.switch(interior, 1 + xi, 1)
+    value = _gpd_quantile_from_excess(pt.log1p(odds), mu, sigma, xi)
+    upper_mode = pt.lt(xi, -1) | (pt.eq(xi, -1) & pt.gt(kappa, 1))
+    return pt.switch(upper_mode, _gpd_upper_bound(mu, sigma, xi), value)
 
 
 def _variance(sigma, xi, kappa):

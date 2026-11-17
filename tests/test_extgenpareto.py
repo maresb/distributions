@@ -626,3 +626,41 @@ def test_logp_gradient_is_continuous_through_xi_zero():
     h = 1e-5
     fd = (fn(h)[0] - fn(-h)[0]) / (2 * h)
     assert abs(grad0 - fd) < 1e-5
+
+
+def test_density_gradient_endpoint_and_mode():
+    kappa = pt.dscalar()
+    score = pt.grad(ExtGenPareto.logpdf(1.0, 0.0, 1.0, 0.0, kappa), kappa)
+    np.testing.assert_allclose(score.eval({kappa: 1.0}), 1 + np.log(-np.expm1(-1)))
+    assert np.isclose(ExtGenPareto.logpdf(1.0, 0.0, 1.0, -1.0, 2.0).eval(), np.log(2))
+    assert np.isposinf(ExtGenPareto.logpdf(0.5, 0.0, 1.0, -2.0, 1.0).eval())
+    np.testing.assert_allclose(
+        ExtGenPareto.mode(0.0, 1.0, np.array([-1.0, 2.0]), 2.0).eval(), [1.0, 7 / 18]
+    )
+    np.testing.assert_allclose(ExtGenPareto.ppf_logit(0.0, 0.0, 1.0, 0.0, 1.0).eval(), np.log(2))
+
+
+@pytest.mark.parametrize("dist,extra", [(GenPareto, ()), (ExtGenPareto, (2.0,))])
+def test_implicit_batch_draws_match_explicit_size(dist, extra):
+    loc = np.arange(4.0)
+
+    def draw(size):
+        rng = pytensor.shared(np.random.default_rng(42))
+        return dist.rvs(loc, 1.0, 0.0, *extra, size=size, random_state=rng).eval()
+
+    np.testing.assert_array_equal(draw(None), draw((4,)))
+
+
+def test_upper_tail_when_standardization_or_product_overflows():
+    for x, sigma, xi in [(1.0e308, 1.0, 2.0), (10.0, 1.0e-308, 0.5)]:
+        log_s = -(np.log(x) - np.log(sigma) + np.log(xi)) / xi
+        np.testing.assert_allclose(GenPareto.logsf(x, 0.0, sigma, xi).eval(), log_s)
+        np.testing.assert_allclose(
+            ExtGenPareto.logsf(x, 0.0, sigma, xi, 2.0).eval(), np.log(2) + log_s
+        )
+    # The GPD survival underflows before multiplying by the carrier.
+    np.testing.assert_allclose(
+        ExtGenPareto.logcdf(800.0, 0.0, 1.0, 0.0, 1.0e300).eval(),
+        -np.exp(np.log(1.0e300) - 800.0),
+        atol=0.0,
+    )
