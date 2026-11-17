@@ -196,29 +196,8 @@ def _safe_xi(xi):
 _MOMENT_SERIES_TERMS = 8  # Taylor order m = 0..8 in xi.
 # |xi| below which the series beats the cancelling exact Beta form: where the series
 # truncation error (~ |xi| ** (TERMS + 1)) reaches float64 eps, i.e. eps ** (1 / (TERMS + 1)).
-# Float64-tuned on purpose -- the series' own joint central moments only reach float64
-# accuracy, so a float32 caller gains nothing from widening it (and the exact form is the
-# accurate branch for moderate |xi| there).
+# Both branches use float64 internally, including for float32 inputs.
 _MOMENT_SERIES_CUTOFF = 1.8e-2
-
-
-# polygamma(d, 1) = (-1) ** (d + 1) * d! * zeta(d + 1), for d = 0..11. Baked as literals
-# because pytensor#2244 makes ``pt.polygamma(d, 1.0)`` (a constant argument) ~1e-9 inaccurate;
-# the runtime path ``pt.polygamma(d, kappa + 1)`` for a *symbolic* argument is exact.
-_POLYGAMMA_AT_ONE = (
-    -0.5772156649015329,
-    1.6449340668482266,
-    -2.404113806319188,
-    6.493939402266829,
-    -24.88626612344089,
-    122.08116743813386,
-    -726.0114797149845,
-    5060.549875237641,
-    -40400.97839874765,
-    363240.9114223827,
-    -3630593.3116066284,
-    39926622.98773108,
-)
 
 
 def _neglogw_raw_moments(kappa):
@@ -228,11 +207,12 @@ def _neglogw_raw_moments(kappa):
     across every moment order.
     """
     n_max = _MOMENT_SERIES_TERMS + 4
+    one = _const_like(1.0, kappa)
     cumulants = []
     for k in range(1, n_max + 1):
         d = k - 1
         poly_kappa = pt.psi(kappa + 1) if d == 0 else pt.polygamma(d, kappa + 1)
-        cumulants.append((-1.0) ** d * (poly_kappa - _const_like(_POLYGAMMA_AT_ONE[d], kappa)))
+        cumulants.append((-1.0) ** d * (poly_kappa - pt.polygamma(d, one)))
     raw = [pt.ones_like(kappa)]
     for n in range(1, n_max + 1):
         raw.append(sum(comb(n - 1, i) * cumulants[n - 1 - i] * raw[i] for i in range(n)))
@@ -282,8 +262,6 @@ def _central_moment_series(r, xi, raw):
             denom = 1
             for n in orders:
                 denom *= factorial(n)
-            # denom matches raw's dtype: a bare factorial >= 2**15 would autocast a
-            # float32 result to float64. It is exact in float32 (< 2**24 here).
             jcm = _joint_central_moment(orders, raw)
             coef = coef + _ordering_count(orders) * jcm / _const_like(denom, raw[0])
         series = series + coef * xi**m
@@ -311,12 +289,24 @@ def _scaled_central_moment(r, xi, kappa, raw):
 
 
 def _central_moments(sigma, xi, kappa):
-    """Central moments ``E[(X - mean) ** r]`` for r = 2, 3, 4."""
+    """Central moments ``E[(X - mean) ** r]`` for r = 2, 3, 4, computed in float64.
+
+    Both the Beta expressions and the series coefficients cancel in float32.
+    Keep the wider precision through normalization, then cast the final statistic.
+    Autodiff retains the float64 working precision through these casts.
+    """
+    sigma, xi, kappa = (pt.cast(p, "float64") for p in (sigma, xi, kappa))
     raw = _neglogw_raw_moments(kappa)
     return tuple(sigma**r * _scaled_central_moment(r, xi, kappa, raw) for r in (2, 3, 4))
 
 
+def _moment_dtype(*params):
+    return pt.true_div(pt.add(*params), 1).dtype
+
+
 def mean(mu, sigma, xi, kappa):
+    dtype = _moment_dtype(mu, sigma, xi, kappa)
+    mu, sigma, xi, kappa = (pt.cast(p, "float64") for p in (mu, sigma, xi, kappa))
     raw = _neglogw_raw_moments(kappa)
     # Raw first scaled moment q1 = (M(xi) - 1)/xi = sum_m mu_{1+m}/(1+m)! xi^m near xi = 0.
     series = sum(
@@ -327,7 +317,7 @@ def mean(mu, sigma, xi, kappa):
     q1 = pt.switch(
         pt.lt(pt.abs(xi), _MOMENT_SERIES_CUTOFF), series, (_pow_moment(1, sx, kappa) - 1) / sx
     )
-    return pt.switch(pt.lt(xi, 1), mu + sigma * q1, np.inf)
+    return pt.switch(pt.lt(xi, 1), mu + sigma * q1, np.inf).astype(dtype)
 
 
 def median(mu, sigma, xi, kappa):
@@ -359,26 +349,30 @@ def mode(mu, sigma, xi, kappa):
     return pt.switch(pt.lt(xi, -1), upper, pt.switch(pt.le(kappa, 1.0), at_mu, interior))
 
 
-def var(mu, sigma, xi, kappa):
+def _variance(sigma, xi, kappa):
     variance, _, _ = _central_moments(sigma, xi, kappa)
     return pt.switch(pt.lt(xi, 0.5), variance, np.inf)
 
 
+def var(mu, sigma, xi, kappa):
+    return _variance(sigma, xi, kappa).astype(_moment_dtype(sigma, xi, kappa))
+
+
 def std(mu, sigma, xi, kappa):
-    return pt.sqrt(var(mu, sigma, xi, kappa))
+    return pt.sqrt(_variance(sigma, xi, kappa)).astype(_moment_dtype(sigma, xi, kappa))
 
 
 def skewness(mu, sigma, xi, kappa):
     variance, central3, _ = _central_moments(sigma, xi, kappa)
-    nan = _const_like(np.nan, mu, sigma, xi, kappa)
-    return pt.switch(pt.lt(xi, 1.0 / 3.0), central3 / variance**1.5, nan)
+    value = pt.switch(pt.lt(xi, 1.0 / 3.0), central3 / variance**1.5, np.nan)
+    return value.astype(_moment_dtype(mu, sigma, xi, kappa))
 
 
 def kurtosis(mu, sigma, xi, kappa):
     # Excess kurtosis.
     variance, _, central4 = _central_moments(sigma, xi, kappa)
-    nan = _const_like(np.nan, mu, sigma, xi, kappa)
-    return pt.switch(pt.lt(xi, 0.25), central4 / variance**2 - 3, nan)
+    value = pt.switch(pt.lt(xi, 0.25), central4 / variance**2 - 3, np.nan)
+    return value.astype(_moment_dtype(mu, sigma, xi, kappa))
 
 
 def entropy(mu, sigma, xi, kappa):

@@ -1,12 +1,15 @@
 """Tests for the Extended Generalized Pareto distribution."""
 
-from decimal import Decimal, getcontext
+from decimal import Decimal, getcontext, localcontext
+from functools import cache
+from math import comb, prod
 
 import numpy as np
 import pytensor
 import pytensor.tensor as pt
 import pytest
 import scipy.stats.distributions as sp
+from pytensor.compile.mode import get_default_mode
 from scipy import integrate, stats
 from scipy.special import expit
 
@@ -14,15 +17,24 @@ from pytensor_distributions import extgenpareto as ExtGenPareto
 from pytensor_distributions import genpareto as GenPareto
 
 
+def _moment_mode():
+    mode = get_default_mode()
+    if pytensor.config.mode == "FAST_COMPILE":
+        # Flattening the series creates Adds beyond the Python evaluator's 32-operand limit.
+        mode = mode.excluding("local_add_canonizer")
+    return mode
+
+
+@cache
 def _compile_scalar(fn, n):
     """Compile ``fn(x, *params)`` for scalar inputs (used by the quad moment checks)."""
     x = pt.dscalar("x")
     ps = [pt.dscalar(f"p{i}") for i in range(n)]
-    return pytensor.function([x, *ps], fn(x, *ps), on_unused_input="ignore")
+    return pytensor.function([x, *ps], fn(x, *ps), on_unused_input="ignore", mode=_moment_mode())
 
 
 def _stat(fn, *params):
-    return float(fn(*[pt.constant(v, dtype="float64") for v in params]).eval())
+    return float(_compile_scalar(fn, len(params) - 1)(*params))
 
 
 _MOMENT_CASES = [
@@ -457,16 +469,106 @@ def test_logsf_small_kappa_in_the_body_matches_reference(kappa):
 
 @pytest.mark.parametrize("dtype", ["float64", "float32"])
 def test_summary_stats_follow_input_dtype(dtype):
-    """mean/var/std/skewness/kurtosis/entropy/median/lmoments keep the input dtype.
-
-    (Value precision under float32 is a separate matter -- the high-order central
-    moments cancel and lose accuracy in a small-|xi| band; only the dtype is asserted.)
-    """
+    """Summary statistics keep the input dtype."""
     params = [pt.scalar(name, dtype=dtype) for name in ("mu", "sigma", "xi", "kappa")]
     names = ["mean", "var", "std", "skewness", "kurtosis", "entropy"]
     names += ["median", "lmoment1", "lmoment2", "lmoment3", "lmoment4"]
     for name in names:
         assert getattr(ExtGenPareto, name)(*params).dtype == dtype, name
+
+
+def _integer_kappa_moments(xi, kappa):
+    """High-precision reference using the finite-product Beta formula for integer kappa."""
+    with localcontext() as ctx:
+        ctx.prec = 80
+        xi = Decimal(float(xi))
+        if xi:
+            powers = [
+                prod(Decimal(j) / (j - r * xi) for j in range(1, kappa + 1)) for r in range(5)
+            ]
+            mean = (powers[1] - 1) / xi
+            var, central3, central4 = [
+                sum(comb(r, i) * (-powers[1]) ** (r - i) * powers[i] for i in range(r + 1)) / xi**r
+                for r in (2, 3, 4)
+            ]
+        else:
+            # At xi=0, X is the sum of independent exponentials with rates 1..kappa.
+            h1, h2, h3, h4 = [
+                sum(Decimal(j) ** -r for j in range(1, kappa + 1)) for r in range(1, 5)
+            ]
+            mean, var, central3, central4 = h1, h2, 2 * h3, 6 * h4 + 3 * h2**2
+        return np.array(
+            [
+                float(v)
+                for v in (
+                    mean,
+                    var,
+                    var.sqrt(),
+                    central3 / var ** Decimal("1.5"),
+                    central4 / var**2 - 3,
+                )
+            ]
+        )
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_moment_precision_near_zero(dtype):
+    xi = pt.vector("xi", dtype=dtype)
+    kappa = pt.scalar("kappa", dtype=dtype)
+    mu, sigma = (np.asarray(v, dtype=dtype) for v in (0, 1))
+    stats = (
+        ExtGenPareto.mean,
+        ExtGenPareto.var,
+        ExtGenPareto.std,
+        ExtGenPareto.skewness,
+        ExtGenPareto.kurtosis,
+    )
+    outputs = [stat(mu, sigma, xi, kappa) for stat in stats]
+    fn = pytensor.function([xi, kappa], outputs, mode=_moment_mode())
+    # Both sides of zero and of the series cutoff, including the float32 failure at 0.02.
+    xis = np.array(
+        [-0.05, -0.0181, -0.0179, -1e-5, 0, 1e-5, 0.0179, 0.0181, 0.02, 0.05], dtype=dtype
+    )
+    for kv in (1, 2, 5):
+        actual = fn(xis, np.asarray(kv, dtype=dtype))
+        expected = np.array([_integer_kappa_moments(xv, kv) for xv in xis]).T
+        for result, reference in zip(actual, expected, strict=True):
+            assert result.dtype == dtype
+            np.testing.assert_allclose(result, reference, rtol=2e-6 if dtype == "float32" else 1e-7)
+
+
+def test_moments_with_integer_parameters():
+    for stat in (
+        ExtGenPareto.mean,
+        ExtGenPareto.var,
+        ExtGenPareto.std,
+        ExtGenPareto.skewness,
+        ExtGenPareto.kurtosis,
+    ):
+        assert stat(0, 1, 0, 2).dtype == pytensor.config.floatX
+    assert np.isclose(ExtGenPareto.mean(0, 1, 0, 2).eval(), 1.5)
+
+
+def test_float32_moment_gradients_at_zero():
+    xi = pt.fscalar("xi")
+    kappa = pt.fscalar("kappa")
+    stats = (
+        ExtGenPareto.mean,
+        ExtGenPareto.var,
+        ExtGenPareto.std,
+        ExtGenPareto.skewness,
+        ExtGenPareto.kurtosis,
+    )
+    total = sum(stat(np.float32(0), np.float32(1), xi, kappa) for stat in stats)
+    assert total.dtype == "float32"
+    derivative = pt.grad(total, xi)
+    fn = pytensor.function([xi, kappa], derivative, mode=_moment_mode())
+    step = 1e-6
+    for kv in (1, 2, 5):
+        reference = (_integer_kappa_moments(step, kv) - _integer_kappa_moments(-step, kv)).sum() / (
+            2 * step
+        )
+        np.testing.assert_allclose(fn(np.float32(0), np.float32(kv)), reference, rtol=2e-6)
 
 
 def test_boundary_logp_value_holds_but_gradient_tracks_the_margin():
