@@ -33,8 +33,10 @@ DISTRIBUTIONS = [
     "chisquared",
     "exgaussian",
     "exponential",
+    "extgenpareto",
     "frechet",
     "gamma",
+    "genpareto",
     "gumbel",
     "halfcauchy",
     "halfnormal",
@@ -130,3 +132,16 @@ def test_pure_elemwise_expressions_fuse_under_numba_rewrites(module_name, functi
         f"node(s), expected at most {max_compute_nodes}: "
         f"{[type(node.op).__name__ for node in nodes]}."
     )
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["mean", "var", "std", "skewness", "kurtosis", "lmoment1", "lmoment2", "lmoment3", "lmoment4"],
+)
+def test_extgenpareto_moment_reductions(name):
+    """Quadrature uses one fixed node axis, with graph size independent of node count."""
+    module = importlib.import_module("pytensor_distributions.extgenpareto")
+    fn = getattr(module, name)
+    inputs = array_inputs_for(fn)
+    compiled = compile_fn(fn(*inputs), inputs, mode=OPTIMIZED_MODE)
+    assert len(compute_nodes(compiled)) < 32

@@ -1,17 +1,19 @@
-from math import comb, factorial
+from math import comb
 
 import numpy as np
 import pytensor.tensor as pt
-from pytensor.tensor.special import betaln
+from scipy.special import roots_legendre
 
 from pytensor_distributions.genpareto import (
     _const_like,
     _draw_size,
     _endpoint_logpdf,
+    _expm1_div,
     _gpd_coordinates,
     _gpd_quantile_from_excess,
     _gpd_upper_bound,
     _log1p_div,
+    _moment_dtype,
 )
 from pytensor_distributions.helper import ppf_bounds_cont
 
@@ -163,158 +165,106 @@ def rvs(mu, sigma, xi, kappa, size=None, random_state=None):
     return _gpd_quantile_from_excess(excess, mu, sigma, xi)
 
 
-# Summary statistics. With x = mu + (sigma/xi)(W ** (-xi) - 1), W ~ Beta(1, kappa), the
-# r-th central moment is sigma ** r times q_r = E[((W ** (-xi) - 1)/xi - mean) ** r]. Its
-# exact Beta-function form is finite (like the plain GPD) only for r xi < 1 -- hence the
-# guards -- and cancels catastrophically as xi -> 0. q_r is one function of the order r:
-# near xi = 0 a Taylor series in xi (the same idea as _log1p_div / _expm1_div), the exact
-# Beta combination otherwise. The series coefficients are generic in r -- joint central
-# moments of L = -log(W), each tamed by a 1/(n!) factor so the factorial growth of the raw
-# moments does not spoil convergence -- built from L's cumulants
-#   kappa_k = (-1) ** (k - 1) [psi ** (k - 1)(kappa + 1) - psi ** (k - 1)(1)].
+# For E ~ Exp(1), W = 1 - exp(-E/kappa) is Beta(1, kappa) and the
+# standardized quantile is expm1(-xi * log W) / xi. Near zero, integrate
+# this smooth function directly instead of differencing nearly equal Beta
+# moments. A fixed rule makes the graph differentiable, including at xi=0.
+# With E=min(1,kappa)*exp(s), the lower tail of the fourth-moment integrand
+# decays at least as exp((1-4*0.1)*s); the upper tail decays exponentially
+# in exp(s), either in the density or in the quantile.
+_NODES, _WEIGHTS = roots_legendre(160)
+_LOG_E = (5.0 + 90.0) / 2 * _NODES + (5.0 - 90.0) / 2
+_E = np.exp(_LOG_E)
+_NEG_LOG_W = -np.log(-np.expm1(-_E))
+_NEG_LOG_W[_E > 1] = -np.log1p(-np.exp(-_E[_E > 1]))
+_WEIGHTS = (5.0 + 90.0) / 2 * _WEIGHTS * _E
 
 
-def _pow_moment(j, xi, kappa):
-    """``E[W ** (-j xi)] = kappa * B(1 - j xi, kappa)`` for ``W ~ Beta(1, kappa)``."""
-    return pt.exp(pt.log(kappa) + betaln(1 - j * xi, kappa))
-
-
-def _safe_xi(xi):
-    """Nonzero stand-in for ``xi`` used only in the discarded ``xi != 0`` moment branch.
-
-    The Beta-function forms divide by ``xi``; at ``xi = 0`` that branch is not selected,
-    but ``pt.switch`` still differentiates it, so a raw ``0/0`` would make the gradient
-    ``nan``. The placeholder ``0.1`` lies in ``(0, 1/4)``, keeping every ``B(1 - j xi,
-    kappa)`` (``j <= 4``) and ``B(n kappa, 1 - xi)`` finite.
-    """
-    return pt.switch(pt.eq(xi, 0.0), _const_like(0.1, xi), xi)
-
-
-_MOMENT_SERIES_TERMS = 8  # Taylor order m = 0..8 in xi.
-# |xi| below which the series beats the cancelling exact Beta form: where the series
-# truncation error (~ |xi| ** (TERMS + 1)) reaches float64 eps, i.e. eps ** (1 / (TERMS + 1)).
-# Both branches use float64 internally, including for float32 inputs.
-_MOMENT_SERIES_CUTOFF = 1.8e-2
-
-
-def _neglogw_raw_moments(kappa):
-    """Raw moments ``mu_0 .. mu_{TERMS + 4}`` of ``L = -log(W)``, ``W ~ Beta(1, kappa)``.
-
-    Built once from L's cumulants (polygamma) via the moment-cumulant recursion and shared
-    across every moment order.
-    """
-    n_max = _MOMENT_SERIES_TERMS + 4
-    one = _const_like(1.0, kappa)
-    cumulants = []
-    for k in range(1, n_max + 1):
-        d = k - 1
-        poly_kappa = pt.psi(kappa + 1) if d == 0 else pt.polygamma(d, kappa + 1)
-        cumulants.append((-1.0) ** d * (poly_kappa - pt.polygamma(d, one)))
-    raw = [pt.ones_like(kappa)]
-    for n in range(1, n_max + 1):
-        raw.append(sum(comb(n - 1, i) * cumulants[n - 1 - i] * raw[i] for i in range(n)))
-    return raw
-
-
-def _partitions(total, parts):
-    """Non-increasing tuples of ``parts`` positive integers summing to ``total``."""
-    if parts == 1:
-        if total >= 1:
-            yield (total,)
-        return
-    for first in range(total - parts + 1, 0, -1):
-        for rest in _partitions(total - first, parts - 1):
-            if rest[0] <= first:
-                yield (first, *rest)
-
-
-def _ordering_count(partition):
-    """How many distinct orderings ``partition`` has (its multinomial coefficient)."""
-    count = factorial(len(partition))
-    for value in set(partition):
-        count //= factorial(partition.count(value))
-    return count
-
-
-def _joint_central_moment(orders, raw):
-    """Joint central moment ``E[prod_i (L ** o_i - mu_{o_i})]`` by subset inclusion-exclusion."""
-    r = len(orders)
-    total = 0.0
-    for mask in range(1 << r):
-        kept = sum(orders[i] for i in range(r) if mask >> i & 1)
-        term = raw[kept]
-        for i in range(r):
-            if not mask >> i & 1:
-                term = term * (-raw[orders[i]])
-        total = total + term
-    return total
-
-
-def _central_moment_series(r, xi, raw):
-    """Taylor series of ``q_r`` in ``xi``; the 1/n! factors tame the factorial raw moments."""
-    series = 0.0
-    for m in range(_MOMENT_SERIES_TERMS + 1):
-        coef = 0.0
-        for orders in _partitions(m + r, r):  # orders_i = j_i + 1 >= 1, sum_i = m + r
-            denom = 1
-            for n in orders:
-                denom *= factorial(n)
-            jcm = _joint_central_moment(orders, raw)
-            coef = coef + _ordering_count(orders) * jcm / _const_like(denom, raw[0])
-        series = series + coef * xi**m
-    return series
-
-
-def _central_moment_exact(r, xi, kappa):
-    """Exact ``q_r`` from the Beta moments ``E[Y ** i] = M(i xi)``; accurate away from xi = 0."""
-    sx = _safe_xi(xi)
-    mean_y = _pow_moment(1, sx, kappa)
-    central = sum(
-        comb(r, i) * (-1.0) ** (r - i) * _pow_moment(i, sx, kappa) * mean_y ** (r - i)
-        for i in range(r + 1)
+def _quadrature(xi, kappa):
+    """Weights and quantiles centered at log(max(kappa, 1)) in log-W space."""
+    scale = pt.switch(kappa >= 1, 1.0, kappa)[..., None]
+    v = _E / pt.switch(kappa >= 1, kappa, 1.0)[..., None]
+    # For large kappa subtract log(kappa) analytically, before rounding.
+    centered = pt.switch(
+        (kappa >= 1)[..., None],
+        -_LOG_E - pt.log(_expm1_div(-v)),
+        _NEG_LOG_W,
     )
-    return central / sx**r
+    quantiles = centered * _expm1_div(xi[..., None] * centered)
+    return scale * _WEIGHTS * pt.exp(-scale * _E), quantiles
 
 
-def _scaled_central_moment(r, xi, kappa, raw):
-    """``q_r = E[((W ** (-xi) - 1)/xi - mean) ** r]``: series near xi = 0, exact otherwise."""
+def _stirling_correction(z):
+    inv = 1 / z
+    return inv * (1 / 12 + inv**2 * (-1 / 360 + inv**2 * (1 / 1260 - inv**2 / 1680)))
+
+
+def _log_power(t, kappa, anchor):
+    """Log E[W**(-t)] - t*anchor, avoiding cancellation for large kappa."""
+    z = 1 + kappa
+    d = z - t
+    direct = pt.gammaln(z) - pt.gammaln(d) - t * anchor
+    # Subtract the Stirling expansions analytically. At z,d >= 16 the
+    # first omitted term in each log-gamma is below 1.3e-14.
+    large = (z >= 16) & (d >= 16)
+    zs, ds = pt.switch(large, z, 16.0), pt.switch(large, d, 16.0)
+    ratio = (
+        t * pt.log1p(1 / pt.maximum(kappa, 1))
+        + (ds - 0.5) * pt.log1p(t / ds)
+        - t
+        + _stirling_correction(zs)
+        - _stirling_correction(ds)
+    )
+    return pt.gammaln(1 - t) + pt.switch(large, ratio, direct)
+
+
+def _unit_stat(xi, kappa, order, mean_origin=0.0):
+    """Mean, variance, skewness or excess kurtosis at unit scale and zero location."""
+    xi, kappa = pt.cast(xi, "float64"), pt.cast(kappa, "float64")
+    near = pt.abs(xi) <= 0.1
+    small_xi = pt.switch(near, xi, 0.0)
+    # Both branches of a symbolic switch can be evaluated and differentiated.
+    t = pt.switch(~near & (xi < 1 / order), xi, 0.125)
+    anchor = pt.log(pt.switch(kappa >= 1, kappa, 1.0))
+    weights, q = _quadrature(small_xi, kappa)
+    log_first = _log_power(t, kappa, anchor)
+    first = (weights * q).sum(axis=-1)
+
+    if order == 1:
+        offset = anchor - mean_origin
+        approx = offset * _expm1_div(small_xi * offset) + pt.exp(small_xi * offset) * first
+        exact = pt.expm1(log_first + t * offset) / t
+        return pt.switch(xi < 1, pt.switch(near, approx, exact), np.inf)
+
+    # The exact expressions use moments of W**(-xi) relative to its mean.
+    # expm1 removes the common constant from the binomial central moments.
+    ratios = [
+        pt.expm1(_log_power(j * t, kappa, anchor) - j * log_first) for j in range(2, order + 1)
+    ]
+    # For kappa < 1, the omitted upper E tail may carry probability mass,
+    # but its quantile is zero. Its contribution to the raw moments is negligible.
+    raw = [pt.ones_like(first), first]
+    raw.extend((weights * q**j).sum(axis=-1) for j in range(2, order + 1))
+
+    var_q = raw[2] - first**2
+    if order == 2:
+        exact = pt.exp(2 * (log_first + t * anchor)) * ratios[0] / t**2
+        return pt.switch(
+            xi < 0.5, pt.switch(near, pt.exp(2 * small_xi * anchor) * var_q, exact), np.inf
+        )
+    exact_central = sum(
+        comb(order, j) * (-1) ** (order - j) * ratios[j - 2] for j in range(2, order + 1)
+    )
+    exact = pt.sign(t) ** order * exact_central / ratios[0] ** (order / 2)
+    central = sum(comb(order, j) * (-first) ** (order - j) * raw[j] for j in range(order + 1))
+    approx = central / var_q ** (order / 2)
     return pt.switch(
-        pt.lt(pt.abs(xi), _MOMENT_SERIES_CUTOFF),
-        _central_moment_series(r, xi, raw),
-        _central_moment_exact(r, xi, kappa),
+        xi < 1 / order, pt.switch(near, approx, exact) - (3 if order == 4 else 0), np.nan
     )
-
-
-def _central_moments(sigma, xi, kappa):
-    """Central moments ``E[(X - mean) ** r]`` for r = 2, 3, 4, computed in float64.
-
-    Both the Beta expressions and the series coefficients cancel in float32.
-    Keep the wider precision through normalization, then cast the final statistic.
-    Autodiff retains the float64 working precision through these casts.
-    """
-    sigma, xi, kappa = (pt.cast(p, "float64") for p in (sigma, xi, kappa))
-    raw = _neglogw_raw_moments(kappa)
-    return tuple(sigma**r * _scaled_central_moment(r, xi, kappa, raw) for r in (2, 3, 4))
-
-
-def _moment_dtype(*params):
-    return pt.true_div(pt.add(*params), 1).dtype
 
 
 def mean(mu, sigma, xi, kappa):
-    dtype = _moment_dtype(mu, sigma, xi, kappa)
-    mu, sigma, xi, kappa = (pt.cast(p, "float64") for p in (mu, sigma, xi, kappa))
-    raw = _neglogw_raw_moments(kappa)
-    # Raw first scaled moment q1 = (M(xi) - 1)/xi = sum_m mu_{1+m}/(1+m)! xi^m near xi = 0.
-    series = sum(
-        raw[1 + m] / _const_like(factorial(1 + m), raw[1 + m]) * xi**m
-        for m in range(_MOMENT_SERIES_TERMS + 1)
-    )
-    sx = _safe_xi(xi)
-    q1 = pt.switch(
-        pt.lt(pt.abs(xi), _MOMENT_SERIES_CUTOFF), series, (_pow_moment(1, sx, kappa) - 1) / sx
-    )
-    return pt.switch(pt.lt(xi, 1), mu + sigma * q1, np.inf).astype(dtype)
+    return (mu + sigma * _unit_stat(xi, kappa, 1)).astype(_moment_dtype(mu, sigma, xi, kappa))
 
 
 def median(mu, sigma, xi, kappa):
@@ -335,29 +285,23 @@ def mode(mu, sigma, xi, kappa):
     return pt.switch(upper_mode, _gpd_upper_bound(mu, sigma, xi), value)
 
 
-def _variance(sigma, xi, kappa):
-    variance, _, _ = _central_moments(sigma, xi, kappa)
-    return pt.switch(pt.lt(xi, 0.5), variance, np.inf)
-
-
 def var(mu, sigma, xi, kappa):
-    return _variance(sigma, xi, kappa).astype(_moment_dtype(sigma, xi, kappa))
+    return (pt.cast(sigma, "float64") ** 2 * _unit_stat(xi, kappa, 2)).astype(
+        _moment_dtype(sigma, xi, kappa)
+    )
 
 
 def std(mu, sigma, xi, kappa):
-    return pt.sqrt(_variance(sigma, xi, kappa)).astype(_moment_dtype(sigma, xi, kappa))
+    return (sigma * pt.sqrt(_unit_stat(xi, kappa, 2))).astype(_moment_dtype(sigma, xi, kappa))
 
 
 def skewness(mu, sigma, xi, kappa):
-    variance, central3, _ = _central_moments(sigma, xi, kappa)
-    value = pt.switch(pt.lt(xi, 1.0 / 3.0), central3 / variance**1.5, np.nan)
+    value = pt.broadcast_arrays(_unit_stat(xi, kappa, 3), mu, sigma)[0]
     return value.astype(_moment_dtype(mu, sigma, xi, kappa))
 
 
 def kurtosis(mu, sigma, xi, kappa):
-    # Excess kurtosis.
-    variance, _, central4 = _central_moments(sigma, xi, kappa)
-    value = pt.switch(pt.lt(xi, 0.25), central4 / variance**2 - 3, np.nan)
+    value = pt.broadcast_arrays(_unit_stat(xi, kappa, 4), mu, sigma)[0]
     return value.astype(_moment_dtype(mu, sigma, xi, kappa))
 
 
@@ -369,50 +313,41 @@ def entropy(mu, sigma, xi, kappa):
     )
 
 
-# L-moments. With lambda_{r+1} = (sigma kappa / xi) * sum_k p*_{r,k} B(kappa (k+1), 1 - xi)
-# (p* the shifted Legendre coefficients), these reduce to the GPD L-moments at kappa = 1
-# and are finite for xi < 1. Like the ordinary moments they are a 0/0 at xi = 0 and switch
-# to a digamma limit there.
-
-
-def _lbeta(n, xi, kappa):
-    """``B(n kappa, 1 - xi)``."""
-    return pt.exp(betaln(n * kappa, 1 - xi))
-
-
+# The maximum of n draws has the same distribution with carrier n*kappa.
+# The L-moments are linear combinations of these expected maxima.
 def lmoment1(mu, sigma, xi, kappa):
     return mean(mu, sigma, xi, kappa)
 
 
+def _unit_lmoment(xi, kappa, order):
+    xi = pt.cast(xi, "float64")
+    kappa = pt.cast(kappa, "float64")
+    n = np.arange(1, order + 1, dtype="float64")
+    # Strip a common location and scale from the expected maxima. Far into
+    # the bounded tail their ordinary means can round to the same endpoint.
+    origin = pt.log(pt.switch(kappa >= 1, kappa, 1.0))
+    maxima = _unit_stat(
+        pt.switch(xi < 1, xi, 0.0)[..., None], kappa[..., None] * n, 1, origin[..., None]
+    )
+    scale = maxima[..., 1] - maxima[..., 0]
+    if order == 2:
+        value = pt.exp(xi * origin) * scale
+    elif order == 3:
+        value = (2 * maxima[..., 2] - 3 * maxima[..., 1] + maxima[..., 0]) / scale
+    else:
+        value = (
+            5 * maxima[..., 3] - 10 * maxima[..., 2] + 6 * maxima[..., 1] - maxima[..., 0]
+        ) / scale
+    return pt.switch(xi < 1, value, np.inf)
+
+
 def lmoment2(mu, sigma, xi, kappa):
-    sx = _safe_xi(xi)
-    l1, l2 = _lbeta(1, sx, kappa), _lbeta(2, sx, kappa)
-    general = sigma * kappa / sx * (2 * l2 - l1)
-    limit = sigma * (pt.psi(2 * kappa + 1) - pt.psi(kappa + 1))  # xi -> 0
-    value = pt.switch(pt.eq(xi, 0.0), limit, general)
-    return pt.switch(pt.lt(xi, 1), value, np.inf)
+    return (sigma * _unit_lmoment(xi, kappa, 2)).astype(_moment_dtype(sigma, xi, kappa))
 
 
 def lmoment3(mu, sigma, xi, kappa):
-    sx = _safe_xi(xi)
-    l1, l2, l3 = (_lbeta(n, sx, kappa) for n in (1, 2, 3))
-    general = (6 * l3 - 6 * l2 + l1) / (2 * l2 - l1)
-    denom = pt.psi(2 * kappa + 1) - pt.psi(kappa + 1)
-    limit = (2 * pt.psi(3 * kappa + 1) - 3 * pt.psi(2 * kappa + 1) + pt.psi(kappa + 1)) / denom
-    value = pt.switch(pt.eq(xi, 0.0), limit, general)
-    return pt.switch(pt.lt(xi, 1), value, np.inf)
+    return _unit_lmoment(xi, kappa, 3).astype(_moment_dtype(xi, kappa))
 
 
 def lmoment4(mu, sigma, xi, kappa):
-    sx = _safe_xi(xi)
-    l1, l2, l3, l4 = (_lbeta(n, sx, kappa) for n in (1, 2, 3, 4))
-    general = (20 * l4 - 30 * l3 + 12 * l2 - l1) / (2 * l2 - l1)
-    denom = pt.psi(2 * kappa + 1) - pt.psi(kappa + 1)
-    limit = (
-        5 * pt.psi(4 * kappa + 1)
-        - 10 * pt.psi(3 * kappa + 1)
-        + 6 * pt.psi(2 * kappa + 1)
-        - pt.psi(kappa + 1)
-    ) / denom
-    value = pt.switch(pt.eq(xi, 0.0), limit, general)
-    return pt.switch(pt.lt(xi, 1), value, np.inf)
+    return _unit_lmoment(xi, kappa, 4).astype(_moment_dtype(xi, kappa))

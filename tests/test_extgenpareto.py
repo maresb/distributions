@@ -9,7 +9,6 @@ import pytensor
 import pytensor.tensor as pt
 import pytest
 import scipy.stats.distributions as sp
-from pytensor.compile.mode import get_default_mode
 from scipy import integrate, stats
 from scipy.special import expit
 
@@ -17,20 +16,12 @@ from pytensor_distributions import extgenpareto as ExtGenPareto
 from pytensor_distributions import genpareto as GenPareto
 
 
-def _moment_mode():
-    mode = get_default_mode()
-    if pytensor.config.mode == "FAST_COMPILE":
-        # Flattening the series creates Adds beyond the Python evaluator's 32-operand limit.
-        mode = mode.excluding("local_add_canonizer")
-    return mode
-
-
 @cache
 def _compile_scalar(fn, n):
     """Compile ``fn(x, *params)`` for scalar inputs (used by the quad moment checks)."""
     x = pt.dscalar("x")
     ps = [pt.dscalar(f"p{i}") for i in range(n)]
-    return pytensor.function([x, *ps], fn(x, *ps), on_unused_input="ignore", mode=_moment_mode())
+    return pytensor.function([x, *ps], fn(x, *ps), on_unused_input="ignore")
 
 
 def _stat(fn, *params):
@@ -102,7 +93,7 @@ def test_lmoments_reduce_to_gpd_at_kappa_one(mu, sigma, xi):
     "mu, sigma, xi, kappa", [(0.0, 1.0, 0.1, 2.0), (0.0, 1.0, -0.3, 0.7), (0.0, 1.0, 0.0, 2.0)]
 )
 def test_lmoments_match_sample(mu, sigma, xi, kappa):
-    """Closed-form L-moments against sample L-moments (scipy.stats.lmoment)."""
+    """L-moments against sample L-moments (scipy.stats.lmoment)."""
     rng = pt.random.default_rng(42)
     params = [pt.constant(v) for v in (mu, sigma, xi, kappa)]
     data = ExtGenPareto.rvs(*params, size=80_000, random_state=rng).eval()
@@ -122,7 +113,7 @@ def test_lmoments_match_sample(mu, sigma, xi, kappa):
     "mu, sigma, xi, kappa", [(0.0, 1.0, 0.1, 3.0), (0.0, 1.0, -0.2, 2.5), (0.0, 1.0, 0.1, 0.6)]
 )
 def test_mode_is_the_global_maximum(mu, sigma, xi, kappa):
-    """The grid mode carries (within 1%) the largest density over a fine grid."""
+    """The analytic mode carries (within 1%) the largest density over a fine grid."""
     pdf = _compile_scalar(ExtGenPareto.pdf, 4)
     m = _stat(ExtGenPareto.mode, mu, sigma, xi, kappa)
     upper = _stat(ExtGenPareto.ppf, 0.999, mu, sigma, xi, kappa)
@@ -524,7 +515,7 @@ def test_moment_precision_near_zero(dtype):
         ExtGenPareto.kurtosis,
     )
     outputs = [stat(mu, sigma, xi, kappa) for stat in stats]
-    fn = pytensor.function([xi, kappa], outputs, mode=_moment_mode())
+    fn = pytensor.function([xi, kappa], outputs)
     # Both sides of zero and of the series cutoff, including the float32 failure at 0.02.
     xis = np.array(
         [-0.05, -0.0181, -0.0179, -1e-5, 0, 1e-5, 0.0179, 0.0181, 0.02, 0.05], dtype=dtype
@@ -562,7 +553,7 @@ def test_float32_moment_gradients_at_zero():
     total = sum(stat(np.float32(0), np.float32(1), xi, kappa) for stat in stats)
     assert total.dtype == "float32"
     derivative = pt.grad(total, xi)
-    fn = pytensor.function([xi, kappa], derivative, mode=_moment_mode())
+    fn = pytensor.function([xi, kappa], derivative)
     step = 1e-6
     for kv in (1, 2, 5):
         reference = (_integer_kappa_moments(step, kv) - _integer_kappa_moments(-step, kv)).sum() / (
@@ -665,3 +656,26 @@ def test_upper_tail_when_standardization_or_product_overflows():
         -np.exp(np.log(1.0e300) - 800.0),
         atol=0.0,
     )
+
+
+def test_lmoment_values_and_gradients_at_zero():
+    xi = pt.dscalar()
+    stats = (ExtGenPareto.lmoment2, ExtGenPareto.lmoment3, ExtGenPareto.lmoment4)
+    values = [f(0.0, 1.0, xi, 1.0) for f in stats]
+    fn = pytensor.function([xi], [*values, *(pt.grad(v, xi) for v in values)])
+    for shape in (-1e-12, 0.0, 1e-12):
+        np.testing.assert_allclose(fn(shape), [0.5, 1 / 3, 1 / 6, 3 / 4, 4 / 9, 25 / 72], rtol=1e-9)
+
+
+def test_kurtosis_at_large_kappa():
+    xi = pt.dvector()
+    # 80-decimal beta moments on either side of the integration cutoff.
+    result = ExtGenPareto.kurtosis(0.0, 1.0, xi, 1.0e8).eval({xi: [0.02, 0.1000001]})
+    np.testing.assert_allclose(result, [3.0452345562451257, 7.978576570863327], rtol=2e-8)
+
+
+def test_moment_kappa_gradient_at_one():
+    kappa = pt.dscalar()
+    grad = pt.grad(ExtGenPareto.mean(0.0, 1.0, 0.0, kappa), kappa)
+    # At xi=0 the mean is psi(kappa+1) - psi(1).
+    np.testing.assert_allclose(grad.eval({kappa: 1.0}), np.pi**2 / 6 - 1, rtol=1e-10)
