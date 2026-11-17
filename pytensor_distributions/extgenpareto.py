@@ -6,6 +6,7 @@ from pytensor.tensor.special import betaln
 
 from pytensor_distributions.genpareto import (
     _const_like,
+    _draw_size,
     _endpoint_logpdf,
     _gpd_coordinates,
     _gpd_quantile_from_excess,
@@ -26,7 +27,9 @@ def logpdf(x, mu, sigma, xi, kappa):
     log_h = pt.log1mexp(pt.switch(interior, log_s, -1))
     value = pt.log(kappa) + (kappa - 1) * log_h + log_s - log_margin - pt.log(sigma)
     lower_value = pt.switch(
-        pt.eq(kappa, 1), -pt.log(sigma), pt.switch(pt.lt(kappa, 1), np.inf, -np.inf)
+        pt.eq(kappa, 1),
+        log_s - log_margin - pt.log(sigma),
+        pt.switch(pt.lt(kappa, 1), np.inf, -np.inf),
     )
     value = pt.switch(interior, value, pt.switch(pt.eq(delta, 0), lower_value, -np.inf))
     return pt.switch(endpoint, pt.log(kappa) + _endpoint_logpdf(sigma, xi), value)
@@ -41,7 +44,9 @@ def _log_probabilities(x, mu, sigma, xi, kappa):
     # until after scaling, even when exp(log S) itself would underflow.
     small_s = a < log_eps
     log_h = pt.log1mexp(pt.switch(small_s, -1.0, a))
-    log_rate = pt.log(kappa) + pt.switch(small_s, a, pt.log(-log_h))
+    log_rate = pt.log(pt.cast(kappa, pt.add(kappa, a).dtype)) + pt.switch(
+        small_s, a, pt.log(-log_h)
+    )
     logcdf = pt.switch(small_s, -pt.exp(log_rate), kappa * log_h)
     logsf = pt.switch(
         log_rate < log_eps, log_rate, pt.log1mexp(-pt.exp(pt.clip(log_rate, log_eps, 7.0)))
@@ -152,8 +157,7 @@ def ppf_logit(y, mu, sigma, xi, kappa):
 
 def rvs(mu, sigma, xi, kappa, size=None, random_state=None):
     # Inverse-CDF on a carrier draw u = F; excess = -log(1 - u ** (1/kappa)).
-    if size is None:
-        size = pt.broadcast_arrays(mu, sigma, xi, kappa)[0].shape
+    size = _draw_size(size, mu, sigma, xi, kappa)
     u = pt.random.uniform(size=size, rng=random_state, return_next_rng=True)[1]
     excess = _ext_gpd_excess_from_log_prob(pt.log(u), kappa)
     return _gpd_quantile_from_excess(excess, mu, sigma, xi)

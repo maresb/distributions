@@ -5,6 +5,11 @@ from pytensor.tensor.variable import TensorVariable
 from pytensor_distributions.helper import ppf_bounds_cont
 
 
+def _moment_dtype(first, *rest):
+    promoted = pt.add(first, *rest) if rest else first
+    return pt.true_div(promoted, 1).dtype
+
+
 def _const_like(value, *refs):
     """``value`` as a constant in the upcast dtype of ``refs``.
 
@@ -14,8 +19,7 @@ def _const_like(value, *refs):
     keeps each function's output dtype following its arguments while preserving
     full float64 precision when the inputs are float64.
     """
-    dtype = pt.true_div(pt.add(*refs), 1).dtype if len(refs) > 1 else pt.true_div(refs[0], 1).dtype
-    return np.asarray(value, dtype=dtype)
+    return np.asarray(value, dtype=_moment_dtype(*refs))
 
 
 def _series_cutoff(dtype) -> float:
@@ -61,9 +65,9 @@ def _gpd_coordinates(x, mu, sigma, xi):
     """Return log survival and log(1 + xi*z) on the interior, plus support masks."""
     delta = pt.sub(x, mu)
     z = delta / sigma
-    t = xi * z
+    t = xi * pt.switch(pt.eq(xi, 0) & pt.isinf(z), 0.0, z)
     above = pt.lt(xi, 0) & pt.le(1 + t, 0)
-    inside = (delta > 0) & ~above & ~pt.isinf(x)
+    inside = (delta >= 0) & ~above & ~pt.isinf(x)
     # A positive shape has a finite log survival even when z or xi*z overflows.
     large = inside & pt.gt(xi, 0) & (pt.isinf(z) | pt.isinf(t))
     regular = inside & ~large
@@ -157,10 +161,16 @@ def ppf_logit(y, mu, sigma, xi):
     return _gpd_quantile_from_excess(pt.softplus(y), mu, sigma, xi)
 
 
+def _draw_size(size, *params):
+    batch = pt.broadcast_arrays(*params)[0]
+    if size is None:
+        return batch.shape
+    return pt.broadcast_shape(batch, pt.empty(size))
+
+
 def rvs(mu, sigma, xi, size=None, random_state=None):
     # Inverse-CDF on a survival draw: excess = -log(v) avoids the 1 - v cancellation.
-    if size is None:
-        size = pt.broadcast_arrays(mu, sigma, xi)[0].shape
+    size = _draw_size(size, mu, sigma, xi)
     v = pt.random.uniform(size=size, rng=random_state, return_next_rng=True)[1]
     return _gpd_quantile_from_excess(-pt.log(v), mu, sigma, xi)
 
@@ -170,6 +180,7 @@ def rvs(mu, sigma, xi, size=None, random_state=None):
 
 
 def mean(mu, sigma, xi):
+    xi = pt.as_tensor_variable(xi)
     return pt.switch(pt.lt(xi, 1), mu + sigma / (1 - xi), np.inf)
 
 
@@ -186,6 +197,7 @@ def mode(mu, sigma, xi):
 
 
 def var(mu, sigma, xi):
+    xi = pt.as_tensor_variable(xi)
     return pt.switch(pt.lt(xi, 0.5), sigma**2 / ((1 - xi) ** 2 * (1 - 2 * xi)), np.inf)
 
 
@@ -199,6 +211,7 @@ def skewness(mu, sigma, xi):
 
 
 def kurtosis(mu, sigma, xi):
+    xi = pt.as_tensor_variable(xi)
     # Excess kurtosis.
     value = 3 * (1 - 2 * xi) * (2 * xi**2 + xi + 3) / ((1 - 3 * xi) * (1 - 4 * xi)) - 3
     return pt.switch(pt.lt(xi, 0.25), value, _const_like(np.nan, mu, sigma, xi))
@@ -218,12 +231,15 @@ def lmoment1(mu, sigma, xi):
 
 
 def lmoment2(mu, sigma, xi):
+    xi = pt.as_tensor_variable(xi)
     return pt.switch(pt.lt(xi, 1), sigma / ((1 - xi) * (2 - xi)), np.inf)
 
 
 def lmoment3(mu, sigma, xi):
+    xi = pt.as_tensor_variable(xi)
     return pt.switch(pt.lt(xi, 1), (1 + xi) / (3 - xi), np.inf)
 
 
 def lmoment4(mu, sigma, xi):
+    xi = pt.as_tensor_variable(xi)
     return pt.switch(pt.lt(xi, 1), (1 + xi) * (2 + xi) / ((3 - xi) * (4 - xi)), np.inf)

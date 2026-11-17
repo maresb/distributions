@@ -649,6 +649,7 @@ def test_implicit_batch_draws_match_explicit_size(dist, extra):
         return dist.rvs(loc, 1.0, 0.0, *extra, size=size, random_state=rng).eval()
 
     np.testing.assert_array_equal(draw(None), draw((4,)))
+    np.testing.assert_array_equal(draw((3, 1)), draw((3, 4)))
 
 
 def test_upper_tail_when_standardization_or_product_overflows():
